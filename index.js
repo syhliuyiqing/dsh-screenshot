@@ -5,8 +5,11 @@
  * through PowerShell, optionally lets the user drag a rectangle, and answers
  * with PNG bytes. The Client half puts those bytes into the composer as a
  * draft attachment.
+ *
+ * The PowerShell run goes through the Host's `subprocess` service: the
+ * provider owns executable resolution, stdio and teardown, so this package
+ * never holds a raw process capability of its own.
  */
-import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -28,6 +31,9 @@ const DEFAULTS = {
   timeoutMs: 180000,
 }
 
+/** Shell candidates, most preferred first. */
+const SHELL_CANDIDATES = ['pwsh.exe', 'powershell.exe']
+
 export const inject = ['webServer', 'connection']
 
 /**
@@ -38,10 +44,30 @@ export const inject = ['webServer', 'connection']
 export function apply(ctx, config) {
   const options = { ...DEFAULTS, ...(config ?? {}) }
   let tail = Promise.resolve()
+  let shell
+
+  /**
+   * Resolve one PowerShell executable in the provider's execution world.
+   * @returns absolute executable path.
+   */
+  const resolveShell = async () => {
+    if (shell !== undefined) return shell
+    const candidates = [process.env.DSH_POWERSHELL, ...SHELL_CANDIDATES]
+      .filter((value) => typeof value === 'string' && value.length > 0)
+    for (const candidate of candidates) {
+      try {
+        shell = await ctx.subprocess.resolveExecutable(candidate)
+        return shell
+      } catch {
+        // not this one
+      }
+    }
+    throw new Error('PowerShell was not found; set DSH_POWERSHELL to its executable')
+  }
 
   /** Serialize captures so two requests never fight over the minimized window. */
   const capture = (request) => {
-    const current = tail.then(() => captureScreen(options, request))
+    const current = tail.then(() => captureScreen(ctx, resolveShell, options, request))
     tail = current.catch(() => undefined)
     return current
   }
@@ -119,18 +145,21 @@ async function readRequest(req) {
 
 /**
  * Produce one PNG of the desktop or of a user-selected rectangle.
+ * @param ctx - plugin context carrying the subprocess service.
+ * @param resolveShell - cached PowerShell lookup.
  * @param options - resolved options.
  * @param request - capture mode and overlay hint.
  * @returns PNG bytes.
  */
-async function captureScreen(options, request) {
+async function captureScreen(ctx, resolveShell, options, request) {
   if (process.platform !== 'win32') {
     throw new Error('screen capture is implemented for Windows only')
   }
   const directory = await mkdtemp(join(tmpdir(), 'dsh-screenshot-'))
   const target = join(directory, 'capture.png')
   try {
-    await runPowerShell(SCRIPT_PATH, [
+    const shell = await resolveShell()
+    await runPowerShell(ctx, shell, [
       '-OutFile', target,
       '-WindowPid', String(process.pid),
       '-MaxWidth', String(options.maxWidth),
@@ -147,105 +176,83 @@ async function captureScreen(options, request) {
   }
 }
 
-let resolvedShell
-
 /**
- * Find a PowerShell executable once per plugin lifetime.
- * @returns executable name or path.
- */
-async function resolveShell() {
-  if (resolvedShell !== undefined) return resolvedShell
-  const candidates = [
-    process.env.DSH_POWERSHELL,
-    'pwsh.exe',
-    'powershell.exe',
-  ].filter((value) => typeof value === 'string' && value.length > 0)
-  for (const candidate of candidates) {
-    if (await canSpawn(candidate)) {
-      resolvedShell = candidate
-      return candidate
-    }
-  }
-  throw new Error('PowerShell was not found; set DSH_POWERSHELL to its executable')
-}
-
-/**
- * Probe one executable.
- * @param executable - candidate command.
- * @returns whether it starts and exits cleanly.
- */
-function canSpawn(executable) {
-  return new Promise((resolve) => {
-    let settled = false
-    const finish = (value) => {
-      if (settled) return
-      settled = true
-      resolve(value)
-    }
-    try {
-      const child = spawn(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 0'], {
-        windowsHide: true,
-        stdio: 'ignore',
-      })
-      child.once('error', () => finish(false))
-      child.once('exit', (code) => finish(code === 0))
-    } catch {
-      finish(false)
-    }
-  })
-}
-
-/**
- * Run the capture script.
- * @param script - absolute script path.
+ * Run the capture script through the managed subprocess provider.
+ * @param ctx - plugin context.
+ * @param shell - absolute PowerShell path.
  * @param args - script arguments.
- * @param timeoutMs - upper bound; the process is left alive so it can restore the window.
+ * @param timeoutMs - upper bound. A timed-out run keeps going on purpose: the
+ * script restores the minimized window in its own finally block, and killing it
+ * would strand the window off screen.
  */
-function runPowerShell(script, args, timeoutMs) {
-  return resolveShell().then((shell) => new Promise((resolve, reject) => {
-    const child = spawn(shell, [
+async function runPowerShell(ctx, shell, args, timeoutMs) {
+  const provider = ctx.get('subprocess')
+  if (provider === undefined) {
+    throw new Error('this profile mounts no subprocess provider, so PowerShell cannot be started')
+  }
+  const handle = provider.spawn({
+    argv: [
+      shell,
       '-NoLogo',
       '-NoProfile',
       '-NonInteractive',
       '-STA',
       '-ExecutionPolicy', 'Bypass',
-      '-File', script,
+      '-File', SCRIPT_PATH,
       ...args,
-    ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    ],
+    cwd: tmpdir(),
+    stdio: {
+      stdin: 'ignore',
+      stdout: { maxBytes: 65536 },
+      stderr: { maxBytes: 65536 },
+    },
+    graceMs: 3000,
+  })
 
-    let stderr = ''
-    let settled = false
-    let timer
-
-    const settle = (error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      if (error === undefined) resolve()
-      else reject(error)
-    }
-
-    timer = setTimeout(() => {
-      settle(new Error(`capture did not finish within ${timeoutMs}ms`))
-    }, timeoutMs)
-
-    child.stdout.on('data', () => undefined)
-    child.stderr.on('data', (chunk) => {
-      if (stderr.length < 8000) stderr += chunk.toString()
-    })
-    child.once('error', (error) => settle(error))
-    child.once('exit', (code) => {
-      if (code === 0) {
-        settle(undefined)
-        return
-      }
-      if (code === 2) {
-        const cancelled = new Error('capture cancelled')
-        cancelled.code = 'cancelled'
-        settle(cancelled)
-        return
-      }
-      settle(new Error(`PowerShell exited with ${String(code)}: ${stderr.trim().slice(0, 600)}`))
-    })
+  // A race loser must not surface as an unhandled rejection.
+  const outcome = handle.done.catch((error) => ({
+    exitCode: null,
+    signal: null,
+    failure: error instanceof Error ? error.message : String(error),
   }))
+
+  let timer
+  const expired = new Promise((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout(undefined), timeoutMs)
+    timer.unref?.()
+  })
+
+  let settled
+  try {
+    settled = await Promise.race([outcome, expired])
+  } finally {
+    clearTimeout(timer)
+  }
+
+  if (settled === undefined) throw new Error(`capture did not finish within ${timeoutMs}ms`)
+
+  const stderr = readCollected(handle, 'stderr')
+  if (settled.exitCode === 0) return
+  if (settled.exitCode === 2) {
+    const cancelled = new Error('capture cancelled')
+    cancelled.code = 'cancelled'
+    throw cancelled
+  }
+  const reason = settled.failure ?? stderr.trim().slice(0, 600)
+  throw new Error(`PowerShell exited with ${String(settled.exitCode)}: ${reason}`)
+}
+
+/**
+ * Read one collected stream without consuming it.
+ * @param handle - subprocess handle.
+ * @param channel - collected channel name.
+ * @returns decoded text, or an empty string when unavailable.
+ */
+function readCollected(handle, channel) {
+  try {
+    return handle.collected?.[channel]?.readFrom(0).text ?? ''
+  } catch {
+    return ''
+  }
 }

@@ -44,7 +44,7 @@
 | 文件 | 职责 |
 | --- | --- |
 | [`client.js`](client.js) | 输入框下面那个按钮。取到图后调 `conversation.createDrafts()` + `inputActions.addAttachments()`，把 PNG 变成输入框里的待发附件 |
-| [`index.js`](index.js) | Host 半。注册 `POST /dsh-screenshot/capture`，过一遍 `ctx.connection.requestRejection()` 的鉴权，然后串行地跑 PowerShell，回 PNG 字节 |
+| [`index.js`](index.js) | Host 半。注册 `POST /dsh-screenshot/capture`，过一遍 `ctx.connection.requestRejection()` 的鉴权，再通过 Host 的 `subprocess` 服务串行跑 PowerShell，回 PNG 字节 |
 | [`capture.ps1`](capture.ps1) | 真正干活的：沿进程树找到 DSH 的窗口句柄 → 最小化 → 抓虚拟桌面 → 铺一层可选区的遮罩 → 裁切/缩放 → 存 PNG → 不管成败都恢复窗口 |
 
 几个设计取舍：
@@ -53,6 +53,7 @@
 - **选择器只编译一次**。C# 现编译在冷机上要十几秒，所以编译产物缓存到 `%TEMP%\dsh-screenshot\selector-v1.dll`，之后每次调用稳定在 1.5 秒上下。
 - **鉴权走 DSH 自己的那套**。路由没有另开鉴权，直接用 `connection.requestRejection()`，所以只有带着本机浏览器会话 cookie 的页面能调，命令行 `curl` 过去是 401。
 - 图片不落盘：Host 写到临时目录，客户端取走字节后立刻删。
+- 起进程走 Host 的 `subprocess` 服务，不直接引 Node 的进程模块：可执行文件由 provider 解析，stdio 和回收也归 provider，插件手里不留裸的进程能力。
 
 ## 已知限制
 
