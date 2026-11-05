@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Screenshot to Composer",
+    "description": "Hides the DSH window, lets you drag a rectangle over the screen, and drops the cropped PNG straight into the message box as a draft image."
+  }
+}
