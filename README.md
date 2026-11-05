@@ -68,6 +68,16 @@
 - 鉴权：不带浏览器 cookie 直接 POST 返回 401。
 - 浏览器里真实点击这一下：没有浏览器自动化手段，靠手动验证。
 
+## English
+
+A DSH plugin that sits under the message box. Click **Shot**, the DSH window minimizes, you drag a rectangle over the screen, and that crop lands in the composer as a draft image. `Alt` + click grabs the whole screen; right-click or `Esc` cancels.
+
+- Windows 10 / 11 only (capture runs through PowerShell + GDI+).
+- Needs DSH desktop `0.2.1` or newer; the bundled Windows PowerShell 5.1 is enough.
+- Install from the DSH Plugins page by pointing it at this directory.
+- The image never touches disk besides one temp file: it is served over a session-gated loopback route and the temp file is removed right after.
+
 ## License
 
 MIT
+
