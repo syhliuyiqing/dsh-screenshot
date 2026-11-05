@@ -190,7 +190,7 @@ window.__ModuleLoader__.load({
           pending ? h(SpinnerIcon, null) : h(CameraIcon, null),
           h('span', null, pending ? t('busy') : t('label')),
         ),
-        failure === '' ? null : h('span', { className: 'dshshot-error', title: failure }, t('failed')),
+        failure === '' ? null : h('span', { className: 'dshshot-error', title: failure }, t('failed') + ': ' + failure),
       )
     }
 

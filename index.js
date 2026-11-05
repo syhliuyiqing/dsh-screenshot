@@ -6,11 +6,12 @@
  * with PNG bytes. The Client half puts those bytes into the composer as a
  * draft attachment.
  *
- * The PowerShell run goes through the Host's `subprocess` service: the
- * provider owns executable resolution, stdio and teardown, so this package
- * never holds a raw process capability of its own.
+ * The PowerShell run goes through the Host's `subprocess` service: the provider
+ * owns executable resolution, stdio and teardown, so this package never holds a
+ * raw process capability of its own.
  */
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,6 +20,10 @@ import { fileURLToPath } from 'node:url'
 const CAPTURE_PATH = '/dsh-screenshot/capture'
 
 const SCRIPT_PATH = join(dirname(fileURLToPath(import.meta.url)), 'capture.ps1')
+
+/** Scratch directory for temporary captures and the failure log. */
+const WORK_DIR = join(tmpdir(), 'dsh-screenshot')
+const LOG_PATH = join(WORK_DIR, 'last-error.log')
 
 const DEFAULTS = {
   /** Longest edge of the produced PNG; larger results are scaled down. */
@@ -31,10 +36,22 @@ const DEFAULTS = {
   timeoutMs: 180000,
 }
 
-/** Shell candidates, most preferred first. */
-const SHELL_CANDIDATES = ['pwsh.exe', 'powershell.exe']
-
 export const inject = ['webServer', 'connection']
+
+/**
+ * Shell candidates, most preferred first. The absolute Windows PowerShell path
+ * comes first because a provider's scrubbed PATH need not contain it.
+ * @returns candidate executables.
+ */
+function shellCandidates() {
+  const root = process.env.SystemRoot ?? 'C:\\Windows'
+  return [
+    process.env.DSH_POWERSHELL,
+    join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    'pwsh.exe',
+    'powershell.exe',
+  ].filter((value) => typeof value === 'string' && value.length > 0)
+}
 
 /**
  * Register the capture route.
@@ -47,27 +64,50 @@ export function apply(ctx, config) {
   let shell
 
   /**
+   * The managed subprocess provider, resolved lazily so a profile without one
+   * fails with a readable reason instead of an empty button.
+   * @returns the provider.
+   */
+  const provider = () => {
+    const service = ctx.get('subprocess')
+    if (service === undefined) {
+      throw new Error('this profile mounts no subprocess provider, so PowerShell cannot be started')
+    }
+    return service
+  }
+
+  /**
    * Resolve one PowerShell executable in the provider's execution world.
    * @returns absolute executable path.
    */
   const resolveShell = async () => {
     if (shell !== undefined) return shell
-    const candidates = [process.env.DSH_POWERSHELL, ...SHELL_CANDIDATES]
-      .filter((value) => typeof value === 'string' && value.length > 0)
-    for (const candidate of candidates) {
+    const attempts = []
+    for (const candidate of shellCandidates()) {
       try {
-        shell = await ctx.subprocess.resolveExecutable(candidate)
+        shell = await provider().resolveExecutable(candidate)
         return shell
-      } catch {
-        // not this one
+      } catch (error) {
+        attempts.push(`${candidate}: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
-    throw new Error('PowerShell was not found; set DSH_POWERSHELL to its executable')
+    // Last resort: an absolute interpreter we can see on disk, used unverified.
+    const fallback = shellCandidates().find((candidate) => candidate.includes('\\') && existsSync(candidate))
+    if (fallback !== undefined) {
+      shell = fallback
+      return shell
+    }
+    throw new Error(`PowerShell was not found. Tried: ${attempts.join(' | ')}`)
   }
 
   /** Serialize captures so two requests never fight over the minimized window. */
   const capture = (request) => {
-    const current = tail.then(() => captureScreen(ctx, resolveShell, options, request))
+    const current = tail
+      .then(() => captureScreen(ctx, provider, resolveShell, options, request))
+      .catch(async (error) => {
+        await logFailure(error)
+        throw error
+      })
     tail = current.catch(() => undefined)
     return current
   }
@@ -77,6 +117,22 @@ export function apply(ctx, config) {
     path: CAPTURE_PATH,
     handler: (req, res) => handle(ctx, capture, req, res),
   }), 'dsh-screenshot: capture route')
+}
+
+/**
+ * Append one line to the scratch failure log. Never throws.
+ * @param error - failure or note.
+ * @param stage - where it happened.
+ */
+async function logFailure(error, stage = 'capture') {
+  const message = error instanceof Error ? `${error.message}${error.code ? ` [${error.code}]` : ''}` : String(error)
+  const line = `${new Date().toISOString()} ${stage} pid=${process.pid} platform=${process.platform}: ${message}\n`
+  try {
+    await mkdir(WORK_DIR, { recursive: true })
+    await writeFile(LOG_PATH, line, { flag: 'a' })
+  } catch {
+    // diagnostics are best-effort
+  }
 }
 
 /**
@@ -145,21 +201,23 @@ async function readRequest(req) {
 
 /**
  * Produce one PNG of the desktop or of a user-selected rectangle.
- * @param ctx - plugin context carrying the subprocess service.
+ * @param ctx - plugin context.
+ * @param provider - subprocess provider accessor.
  * @param resolveShell - cached PowerShell lookup.
  * @param options - resolved options.
  * @param request - capture mode and overlay hint.
  * @returns PNG bytes.
  */
-async function captureScreen(ctx, resolveShell, options, request) {
+async function captureScreen(ctx, provider, resolveShell, options, request) {
   if (process.platform !== 'win32') {
     throw new Error('screen capture is implemented for Windows only')
   }
-  const directory = await mkdtemp(join(tmpdir(), 'dsh-screenshot-'))
+  await mkdir(WORK_DIR, { recursive: true })
+  const directory = await mkdtemp(join(WORK_DIR, 'run-'))
   const target = join(directory, 'capture.png')
   try {
     const shell = await resolveShell()
-    await runPowerShell(ctx, shell, [
+    await runPowerShell(provider(), shell, [
       '-OutFile', target,
       '-WindowPid', String(process.pid),
       '-MaxWidth', String(options.maxWidth),
@@ -178,18 +236,14 @@ async function captureScreen(ctx, resolveShell, options, request) {
 
 /**
  * Run the capture script through the managed subprocess provider.
- * @param ctx - plugin context.
+ * @param provider - subprocess provider.
  * @param shell - absolute PowerShell path.
  * @param args - script arguments.
  * @param timeoutMs - upper bound. A timed-out run keeps going on purpose: the
  * script restores the minimized window in its own finally block, and killing it
  * would strand the window off screen.
  */
-async function runPowerShell(ctx, shell, args, timeoutMs) {
-  const provider = ctx.get('subprocess')
-  if (provider === undefined) {
-    throw new Error('this profile mounts no subprocess provider, so PowerShell cannot be started')
-  }
+async function runPowerShell(provider, shell, args, timeoutMs) {
   const handle = provider.spawn({
     argv: [
       shell,
@@ -201,7 +255,7 @@ async function runPowerShell(ctx, shell, args, timeoutMs) {
       '-File', SCRIPT_PATH,
       ...args,
     ],
-    cwd: tmpdir(),
+    cwd: dirname(SCRIPT_PATH),
     stdio: {
       stdin: 'ignore',
       stdout: { maxBytes: 65536 },
